@@ -28,7 +28,7 @@ type Cond struct {
 	// L is held while observing or changing the condition
 	L Locker
 
-	notify  notifyList
+	notify  notifyList // 协程列表
 	checker copyChecker
 }
 

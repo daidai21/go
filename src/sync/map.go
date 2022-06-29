@@ -32,7 +32,7 @@ import (
 // Delete, LoadAndDelete, and Store are write operations;
 // and LoadOrStore is a write operation when it returns loaded set to false.
 type Map struct {
-	mu Mutex
+	mu Mutex // 加锁
 
 	// read contains the portion of the map's contents that are safe for
 	// concurrent access (with or without mu held).
@@ -43,6 +43,7 @@ type Map struct {
 	// Entries stored in read may be updated concurrently without mu, but updating
 	// a previously-expunged entry requires that the entry be copied to the dirty
 	// map and unexpunged with mu held.
+	// 存读的数据。因为是atomic.Value类型，只读，所以并发是安全的。实际存的是readOnly的数据结构。
 	read atomic.Value // readOnly
 
 	// dirty contains the portion of the map's contents that require mu to be
@@ -63,12 +64,15 @@ type Map struct {
 	// Once enough misses have occurred to cover the cost of copying the dirty
 	// map, the dirty map will be promoted to the read map (in the unamended
 	// state) and the next store to the map will make a new dirty copy.
+	// 计数作用。每次从read中读失败，则计数+1。
 	misses int
 }
 
 // readOnly is an immutable struct stored atomically in the Map.read field.
 type readOnly struct {
-	m       map[any]*entry
+	// 单纯的map结构
+	m map[any]*entry
+	// Map.dirty的数据和这里的 m 中的数据不一样的时候，为true
 	amended bool // true if the dirty map contains some key not in m.
 }
 
@@ -97,6 +101,8 @@ type entry struct {
 	// p != expunged. If p == expunged, an entry's associated value can be updated
 	// only after first setting m.dirty[key] = e so that lookups using the dirty
 	// map find the entry.
+	// 可见value是个指针类型，虽然read和dirty存在冗余情况（amended=false），但是由于是指针类型，存储的空间应该不是问题
+	// sync.Map存储的value是ptr类型，所以存储空间没费多少
 	p unsafe.Pointer // *interface{}
 }
 
@@ -108,20 +114,27 @@ func newEntry(i any) *entry {
 // value is present.
 // The ok result indicates whether value was found in the map.
 func (m *Map) Load(key any) (value any, ok bool) {
+	// 因read只读，线程安全，优先读取
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
+
+	// 如果read没有，并且dirty有新数据，那么去dirty中查找
 	if !ok && read.amended {
 		m.mu.Lock()
 		// Avoid reporting a spurious miss if m.dirty got promoted while we were
 		// blocked on m.mu. (If further loads of the same key will not miss, it's
 		// not worth copying the dirty map for this key.)
+		// 双重检查（原因是前文的if判断和加锁非原子的，害怕这中间发生故事）
 		read, _ = m.read.Load().(readOnly)
 		e, ok = read.m[key]
+
+		// 如果read中还是不存在，并且dirty中有新数据
 		if !ok && read.amended {
 			e, ok = m.dirty[key]
 			// Regardless of whether the entry was present, record a miss: this key
 			// will take the slow path until the dirty map is promoted to the read
 			// map.
+			// m计数+1
 			m.missLocked()
 		}
 		m.mu.Unlock()
@@ -142,27 +155,38 @@ func (e *entry) load() (value any, ok bool) {
 
 // Store sets the value for a key.
 func (m *Map) Store(key, value any) {
+	// 如果m.read存在这个key，并且没有被标记删除，则尝试更新。
 	read, _ := m.read.Load().(readOnly)
 	if e, ok := read.m[key]; ok && e.tryStore(&value) {
 		return
 	}
 
+	// 如果read不存在或者已经被标记删除
 	m.mu.Lock()
 	read, _ = m.read.Load().(readOnly)
+
+	// read 存在该key
 	if e, ok := read.m[key]; ok {
+		// 如果entry被标记expunge，则表明dirty没有key，可添加入dirty，并更新entry。
+
+		// 加入dirty中，这儿是指针
 		if e.unexpungeLocked() {
 			// The entry was previously expunged, which implies that there is a
 			// non-nil dirty map and this entry is not in it.
+			// 更新value值
 			m.dirty[key] = e
 		}
 		e.storeLocked(&value)
-	} else if e, ok := m.dirty[key]; ok {
+	} else if e, ok := m.dirty[key]; ok { //  dirty 存在该key，更新
 		e.storeLocked(&value)
-	} else {
+	} else { // // read 和 dirty都没有
+		// 如果read与dirty相同，则触发一次dirty刷新（因为当read重置的时候，dirty已置为nil了）
 		if !read.amended {
 			// We're adding the first new key to the dirty map.
 			// Make sure it is allocated and mark the read-only map as incomplete.
+			// 将read中未删除的数据加入到dirty中
 			m.dirtyLocked()
+			// amended标记为read与dirty不相同，因为后面即将加入新数据。
 			m.read.Store(readOnly{m: read.m, amended: true})
 		}
 		m.dirty[key] = newEntry(value)
@@ -274,14 +298,20 @@ func (e *entry) tryLoadOrStore(i any) (actual any, loaded, ok bool) {
 // LoadAndDelete deletes the value for a key, returning the previous value if any.
 // The loaded result reports whether the key was present.
 func (m *Map) LoadAndDelete(key any) (value any, loaded bool) {
+	// 读出read，断言为readOnly类型
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
+	// 如果read中没有，并且dirty中有新元素，那么就去dirty中去找。这里用到了amended，当read与dirty不同时为true，说明dirty中有read没有的数据。
+
 	if !ok && read.amended {
 		m.mu.Lock()
+		// 再检查一次，因为前文的判断和锁不是原子操作，防止期间发生了变化。
 		read, _ = m.read.Load().(readOnly)
 		e, ok = read.m[key]
+
 		if !ok && read.amended {
 			e, ok = m.dirty[key]
+			// 直接删除
 			delete(m.dirty, key)
 			// Regardless of whether the entry was present, record a miss: this key
 			// will take the slow path until the dirty map is promoted to the read
@@ -291,6 +321,7 @@ func (m *Map) LoadAndDelete(key any) (value any, loaded bool) {
 		m.mu.Unlock()
 	}
 	if ok {
+		// 如果read中存在该key，则将该value 赋值nil（采用标记的方式删除！）
 		return e.delete()
 	}
 	return nil, false
@@ -307,6 +338,7 @@ func (e *entry) delete() (value any, ok bool) {
 		if p == nil || p == expunged {
 			return nil, false
 		}
+		// 原子操作
 		if atomic.CompareAndSwapPointer(&e.p, p, nil) {
 			return *(*any)(p), true
 		}
@@ -362,19 +394,23 @@ func (m *Map) missLocked() {
 	if m.misses < len(m.dirty) {
 		return
 	}
+	// 将dirty置给read，因为穿透概率太大了(原子操作，耗时很小)
 	m.read.Store(readOnly{m: m.dirty})
 	m.dirty = nil
 	m.misses = 0
 }
 
+// 将read中未删除的数据加入到dirty中
 func (m *Map) dirtyLocked() {
 	if m.dirty != nil {
 		return
 	}
 
+	// 遍历read
 	read, _ := m.read.Load().(readOnly)
 	m.dirty = make(map[any]*entry, len(read.m))
 	for k, e := range read.m {
+		// 通过此次操作，dirty中的元素都是未被删除的，可见标记为expunged的元素不在dirty中！！！
 		if !e.tryExpungeLocked() {
 			m.dirty[k] = e
 		}
