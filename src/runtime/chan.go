@@ -30,6 +30,8 @@ const (
 	debugChan = false
 )
 
+// channel的结构体
+// 环形队列
 type hchan struct {
 	qcount   uint           // total data in the queue
 	dataqsiz uint           // size of the circular queue
